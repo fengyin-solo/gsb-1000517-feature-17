@@ -221,6 +221,36 @@ class RemoteEntry(BaseModel):
     field_6: str | None = None  # 解译人员
     field_7: str | None = None  # 数据状态
 
+
+class RemoteReviewPayload(BaseModel):
+    """影像质量审核：通过则晋升为同源当前有效版本，驳回则仅保留追溯。"""
+
+    action: str
+    note: str | None = None
+
+
+class RemoteConclusionPayload(BaseModel):
+    """登记图斑的一版解译结论；每次登记自增版本序号，供派发冲突裁决。"""
+
+    conclusion: str
+
+
+class RemoteDispatchItem(BaseModel):
+    """集中派发明细行：携带前端所见结论序号，序号落后说明图斑已有更新结论。"""
+
+    polygon_id: int
+    seq: int = 0
+    conclusion: str | None = None
+
+
+class RemoteDispatchPayload(BaseModel):
+    """集中派发请求：幂等键保证同键重放只生效一次。"""
+
+    idempotency_key: str
+    assignee: str
+    items: list[RemoteDispatchItem] = Field(default_factory=list)
+
+
 class MineralEntry(BaseModel):
     """矿化线索明细结构。"""
 
