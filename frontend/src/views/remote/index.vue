@@ -1,130 +1,377 @@
 <template>
-  <section class="page" data-module="remote">
+  <section class="page" data-module="remote-queue">
     <header class="page-head">
       <div>
-        <h2>遥感解译管理</h2>
-        <p class="page-desc">维护遥感数据，围绕数据编号、数据源、分辨率、覆盖面积做登记、筛选与状态流转。</p>
+        <h2>影像核查队列</h2>
+        <p class="page-desc">
+          时间轴与地图联动定位，标出同源多版本、影像分辨率缺口与尚未派发的解译图斑；
+          结论落到遥感清单、图斑待办与存档目录汇总。
+        </p>
       </div>
-      <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记遥感数据</button>
-        <button class="btn" type="button" @click="exportRows">导出遥感解译清单</button>
+      <div class="tab-switch">
+        <button
+          v-for="tab in tabs"
+          :key="tab.key"
+          type="button"
+          :class="['btn', { primary: activeTab === tab.key }]"
+          @click="switchTab(tab.key)"
+        >
+          {{ tab.label }}
+        </button>
       </div>
     </header>
 
-    <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
-        <span class="stat-label">{{ item.label }}</span>
-        <strong class="stat-value">{{ item.value }}</strong>
-      </article>
-    </div>
+    <LocatorBar
+      :conditions="draftConditions"
+      :locator-id="locator.state.locatorId"
+      @update="patchDraft"
+      @apply="applyLocator"
+      @reset="resetLocator"
+      @pin="pinLocator"
+    />
 
-    <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
-      </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
-    </form>
+    <div v-if="message" class="notice" :class="messageKind">{{ message }}</div>
 
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th v-for="column in columns" :key="column">{{ column }}</th>
-          <th>可执行动作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="row in rows" :key="String(row.id)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
-          <td class="row-actions">
-            <button
-              v-for="action in actions"
-              :key="action"
-              class="link"
-              type="button"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
-          </td>
-        </tr>
-        <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无遥感解译数据，可先登记遥感数据</td>
-        </tr>
-      </tbody>
-    </table>
+    <!-- 核查：时间轴 + 地图 + 清单 -->
+    <template v-if="activeTab === 'queue'">
+      <div class="link-grid">
+        <TimelinePanel
+          :months="timelineMonths"
+          :conditions="appliedConditions"
+          :selected="selectedSeries"
+          @select-series="focusSeries"
+          @toggle-month="toggleMonth"
+        />
+        <MapPanel
+          v-if="mapData"
+          :data="mapData"
+          :conditions="appliedConditions"
+          :selected="selectedSeries"
+          @select-cell="selectCell"
+          @select-series="focusSeries"
+          @clear-cell="clearCell"
+        />
+      </div>
+      <QueueList
+        :items="queueItems"
+        :has-more="queueHasMore"
+        :loading="loading"
+        :selected="selectedSeries"
+        @next-page="loadNextQueuePage"
+        @select-series="focusSeries"
+        @open-parcels="openParcelsFor"
+        @review="reviewImage"
+        @delete-image="deleteImage"
+      />
+    </template>
 
-    <footer class="page-foot">
-      <span>共 {{ total }} 条遥感解译记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
-    </footer>
+    <!-- 图斑待办 -->
+    <template v-else-if="activeTab === 'parcels'">
+      <ParcelTodo
+        :parcels="parcelItems"
+        :has-more="parcelHasMore"
+        :sending="dispatching"
+        :last-result="lastDispatch"
+        @dispatch="runDispatch"
+        @next-page="loadNextParcelPage"
+        @locate-series="focusSeries"
+      />
+    </template>
+
+    <!-- 汇总 -->
+    <template v-else-if="activeTab === 'summary' && summaryData">
+      <SummaryPanel
+        :summary="summaryData"
+        @apply-flag="applySummaryFlag"
+        @open-parcels-status="openParcelsByStatus"
+        @locate-series="focusSeries"
+      />
+    </template>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 
-import { request } from '@/api/client'
+import { queueApi } from './api'
+import LocatorBar from './components/LocatorBar.vue'
+import MapPanel from './components/MapPanel.vue'
+import ParcelTodo from './components/ParcelTodo.vue'
+import QueueList from './components/QueueList.vue'
+import SummaryPanel from './components/SummaryPanel.vue'
+import TimelinePanel from './components/TimelinePanel.vue'
+import type {
+  DispatchResult,
+  LocatorConditions,
+  MapData,
+  Parcel,
+  QueueFlag,
+  QueueSeries,
+  Summary,
+  TimelineMonth,
+} from './types'
+import { useLocator } from './useLocator'
 
-type Row = Record<string, string | number | null>
+type TabKey = 'queue' | 'parcels' | 'summary'
+const tabs: { key: TabKey; label: string }[] = [
+  { key: 'queue', label: '核查队列' },
+  { key: 'parcels', label: '图斑待办' },
+  { key: 'summary', label: '汇总页' },
+]
+const activeTab = ref<TabKey>('queue')
 
-const ENDPOINT = '/api/remote'
-const columns = ["数据编号", "数据源", "分辨率", "覆盖面积", "获取日期", "解译内容", "解译人员", "数据状态"]
-const actions = ["开始解译", "完成解译", "归档数据"]
-const statuses = ["已获取", "解译中", "已解译", "已归档"]
-const stats = [{"label": "待解译数据", "value": 0}, {"label": "解译中数据", "value": 0}, {"label": "已归档数据", "value": 0}]
+const locator = useLocator()
+const draftConditions = reactive<LocatorConditions>({ ...locator.state.conditions })
+const appliedConditions = ref<LocatorConditions>({ ...locator.state.conditions })
 
-const rows = ref<Row[]>([])
-const total = ref(0)
-const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const loading = ref(false)
+const message = ref('')
+const messageKind = ref<'ok' | 'err'>('ok')
+const selectedSeries = ref<string | null>(null)
 
-function resetFilters() {
-  filters.value = {}
-  void reload()
+const queueItems = ref<QueueSeries[]>([])
+const queueHasMore = ref(false)
+const timelineMonths = ref<TimelineMonth[]>([])
+const mapData = ref<MapData | null>(null)
+const parcelItems = ref<Parcel[]>([])
+const parcelHasMore = ref(false)
+const summaryData = ref<Summary | null>(null)
+const dispatching = ref(false)
+const lastDispatch = ref<DispatchResult | null>(null)
+
+function notify(text: string, kind: 'ok' | 'err' = 'ok') {
+  message.value = text
+  messageKind.value = kind
 }
 
-function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+function patchDraft(patch: Partial<LocatorConditions>) {
+  Object.assign(draftConditions, patch)
 }
 
-function openCreate() {
-  errorMessage.value = '遥感数据登记入口尚未接入审批流'
+async function applyLocator() {
+  const clean = { ...draftConditions }
+  locator.setConditions(clean)
+  appliedConditions.value = { ...clean }
+  selectedSeries.value = null
+  await refreshViews()
 }
 
-async function runAction(action: string, row: Row) {
-  errorMessage.value = ''
+async function resetLocator() {
+  locator.reset()
+  Object.keys(draftConditions).forEach((key) => delete draftConditions[key as keyof LocatorConditions])
+  appliedConditions.value = {}
+  selectedSeries.value = null
+  await refreshViews()
+}
+
+async function pinLocator() {
   try {
-    const response = await request(`${ENDPOINT}/${row.id}/actions`, {
-      method: 'POST',
-      body: JSON.stringify({ action }),
+    const { locator_id } = await queueApi.saveLocator(appliedConditions.value)
+    locator.state.locatorId = locator_id
+    notify(`定位条件已固化为定位号 ${locator_id}，清单 / 图斑 / 汇总凭此互相关联`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '定位号固化失败', 'err')
+  }
+}
+
+async function loadQueue(reset = false) {
+  loading.value = true
+  try {
+    if (reset) locator.state.queueCursor = null
+    const page = await queueApi.listQueue(
+      appliedConditions.value,
+      reset ? null : locator.state.queueCursor,
+    )
+    // 游标返回的条件快照与本地一致（服务端权威），翻页后条件不会被新参数覆盖。
+    appliedConditions.value = { ...page.conditions }
+    queueItems.value = reset ? page.items : [...queueItems.value, ...page.items]
+    queueHasMore.value = page.has_more
+    locator.state.queueCursor = page.next_cursor
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '核查队列读取失败', 'err')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadNextQueuePage() {
+  if (queueHasMore.value) await loadQueue(false)
+}
+
+async function loadTimeline() {
+  try {
+    const data = await queueApi.timeline(appliedConditions.value)
+    timelineMonths.value = data.months
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '时间轴读取失败', 'err')
+  }
+}
+
+async function loadMap() {
+  try {
+    mapData.value = await queueApi.map(appliedConditions.value)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '地图读取失败', 'err')
+  }
+}
+
+async function loadParcels(reset = false, status?: string) {
+  if (reset) locator.state.parcelCursorId = null
+  const page = await queueApi.listParcels({
+    status,
+    locatorId: locator.state.locatorId,
+    cursorId: reset ? null : locator.state.parcelCursorId,
+  })
+  parcelItems.value = reset ? page.items : [...parcelItems.value, ...page.items]
+  parcelHasMore.value = page.has_more
+  locator.state.parcelCursorId = page.next_cursor_id
+}
+
+async function loadNextParcelPage() {
+  if (parcelHasMore.value) await loadParcels(false)
+}
+
+async function loadSummary() {
+  summaryData.value = await queueApi.summary(locator.state.locatorId)
+}
+
+async function refreshViews() {
+  await Promise.all([loadQueue(true), loadTimeline(), loadMap()])
+  if (activeTab.value === 'parcels') await loadParcels(true)
+  if (activeTab.value === 'summary') await loadSummary()
+}
+
+// ---- 时间轴/地图联动 ----
+function focusSeries(seriesKey: string) {
+  selectedSeries.value = selectedSeries.value === seriesKey ? null : seriesKey
+  draftConditions.keyword = selectedSeries.value ?? ''
+  void applyLocator()
+}
+
+function toggleMonth(dateFrom: string) {
+  draftConditions.date_from = appliedConditions.value.date_from === dateFrom ? '' : dateFrom
+  void applyLocator()
+}
+
+function selectCell(cell: string) {
+  draftConditions.cell = cell || ''
+  void applyLocator()
+}
+
+function clearCell() {
+  if (draftConditions.cell) {
+    draftConditions.cell = ''
+    void applyLocator()
+  }
+}
+
+// ---- 版本动作 ----
+async function reviewImage(imageId: number, result: '审核通过' | '审核驳回') {
+  const note = result === '审核驳回' ? window.prompt('驳回原因（可选）') ?? '' : ''
+  try {
+    const res = await queueApi.review(imageId, result, note)
+    notify(res.message)
+    await refreshViews()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '审核操作失败', 'err')
+  }
+}
+
+async function deleteImage(imageId: number) {
+  if (!window.confirm('删除该影像？仅追溯旧版可删除，既有浏览游标仍可继续翻页。')) return
+  try {
+    const res = await queueApi.deleteImage(imageId)
+    notify(res.message)
+    await refreshViews()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '删除失败', 'err')
+  }
+}
+
+// ---- 图斑派发 ----
+async function runDispatch(payload: {
+  idempotencyKey: string
+  ids: number[]
+  assignee: string
+  conclusion: string
+}) {
+  dispatching.value = true
+  message.value = ''
+  try {
+    // 失败时抛错，不改本地定位条件与勾选，可用同一幂等键重试。
+    const result = await queueApi.dispatch({
+      idempotency_key: payload.idempotencyKey,
+      parcel_ids: payload.ids,
+      assignee: payload.assignee,
+      conclusion: payload.conclusion || undefined,
     })
-    if (!response.ok) {
-      throw new Error('遥感解译动作未生效，请稍后重试')
-    }
-    await reload()
+    lastDispatch.value = result
+    notify(result.message, result.conflicts.length ? 'err' : 'ok')
+    await Promise.all([loadParcels(true), loadMap(), loadQueue(true), loadTimeline()])
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '遥感解译操作失败'
+    // 未成功：维持此前定位上下文，保留勾选与幂等键。
+    lastDispatch.value = null
+    notify(
+      `派发未成功，定位条件与勾选已保留，可用同一幂等键重试：${
+        error instanceof Error ? error.message : '请求失败'
+      }`,
+      'err',
+    )
+  } finally {
+    dispatching.value = false
   }
 }
 
-async function reload() {
-  errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
-  try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
-      throw new Error('遥感数据列表读取失败')
-    }
-    const payload = await response.json()
-    rows.value = payload.items ?? []
-    total.value = payload.total ?? rows.value.length
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '遥感解译列表读取失败'
-  }
+function openParcelsFor(ids: number[]) {
+  activeTab.value = 'parcels'
+  void loadParcels(true).then(() => {
+    parcelItems.value = parcelItems.value.filter((p) => ids.includes(p.id))
+  })
 }
 
-onMounted(reload)
+function openParcelsByStatus(status: string) {
+  activeTab.value = 'parcels'
+  void loadParcels(true, status)
+}
+
+function applySummaryFlag(flag: string) {
+  if (flag === 'all') {
+    delete draftConditions.flag
+  } else {
+    draftConditions.flag = flag as QueueFlag
+  }
+  activeTab.value = 'queue'
+  void applyLocator()
+}
+
+async function switchTab(key: TabKey) {
+  activeTab.value = key
+  selectedSeries.value = null
+  if (key === 'parcels' && !parcelItems.value.length) await loadParcels(true)
+  if (key === 'summary') await loadSummary()
+}
+
+onMounted(refreshViews)
 </script>
+
+<style scoped>
+.tab-switch { display: flex; gap: 6px; }
+.link-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(320px, 1.2fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.notice {
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 10px;
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+}
+.notice.err { border-color: #fcd34d; background: #fffbeb; color: #92400e; }
+@media (max-width: 1100px) {
+  .link-grid { grid-template-columns: 1fr; }
+}
+</style>
